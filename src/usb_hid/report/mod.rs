@@ -2,7 +2,6 @@ use crate::usb_hid::report::field::UsbHidReportField;
 
 pub mod builder;
 pub mod error;
-pub mod feature;
 pub mod field;
 
 #[derive(Debug)]
