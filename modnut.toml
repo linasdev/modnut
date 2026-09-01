@@ -1,0 +1,4 @@
+[[driver.usb-hid]]
+name = "linasdev-lab-ups"
+vendor-id = 0x0463
+product-id = 0x0001
