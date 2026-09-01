@@ -2,12 +2,13 @@ use crate::usb_hid::report::error::UsbHidReportError;
 use hid_types::id::{Unit, UnitExponent};
 use hid_types::item::usage::ExtendedUsage;
 use std::ops::{Div, Range, Rem, Sub};
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub enum UsbHidReportField {
-    Variable(UsbHidReportVariableField),
-    Array(UsbHidReportArrayField),
-    Padding(UsbHidReportPaddingField),
+    Variable(Arc<UsbHidReportVariableField>),
+    Array(Arc<UsbHidReportArrayField>),
+    Padding(Arc<UsbHidReportPaddingField>),
 }
 
 #[derive(Debug)]

@@ -1,12 +1,13 @@
 use crate::usb_hid::report::error::UsbHidReportError;
 use crate::usb_hid::report::field::{
-    UsbHidReportArrayField, UsbHidReportField, UsbHidReportVariableField,
+    UsbHidReportArrayField, UsbHidReportField, UsbHidReportPaddingField, UsbHidReportVariableField,
 };
-use crate::usb_hid::report::{UsbHidReport, UsbHidReportDescriptor};
-use hid_types::id::GlobalItem;
+use crate::usb_hid::report::{UsbHidReport, UsbHidReportCollection, UsbHidReportDescriptor};
+use hid_types::id::{CollectionType, GlobalItem};
 use hid_types::item;
 use hid_types::item::usage::ExtendedUsage;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, Mutex};
 
 macro_rules! current_global_state {
     ($self:ident, $state_type:ident) => {
@@ -34,6 +35,21 @@ pub struct UsbHidReportDescriptorBuilder {
     input_report_fields: HashMap<Option<u8>, Vec<UsbHidReportField>>,
     output_report_fields: HashMap<Option<u8>, Vec<UsbHidReportField>>,
     feature_report_fields: HashMap<Option<u8>, Vec<UsbHidReportField>>,
+    root_collections: Vec<UsbHidReportCollectionBuilder>,
+    open_collections: Vec<UsbHidReportCollectionBuilder>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsbHidReportCollectionBuilder(Arc<Mutex<UsbHidReportCollectionBuilderInner>>);
+
+#[derive(Debug)]
+pub struct UsbHidReportCollectionBuilderInner {
+    usage: ExtendedUsage,
+    collection_type: CollectionType,
+    input_report_ids: BTreeSet<Option<u8>>,
+    output_report_ids: BTreeSet<Option<u8>>,
+    feature_report_ids: BTreeSet<Option<u8>>,
+    child_collections: Vec<UsbHidReportCollectionBuilder>,
 }
 
 impl UsbHidReportDescriptorBuilder {
@@ -46,6 +62,8 @@ impl UsbHidReportDescriptorBuilder {
             input_report_fields: HashMap::new(),
             output_report_fields: HashMap::new(),
             feature_report_fields: HashMap::new(),
+            root_collections: vec![],
+            open_collections: vec![],
         }
     }
 
@@ -80,10 +98,18 @@ impl UsbHidReportDescriptorBuilder {
             .map(|(report_id, fields)| UsbHidReport::new(report_id, fields))
             .collect::<Vec<_>>();
 
+        let root_collections = self
+            .root_collections
+            .into_iter()
+            .map(|collection_builder| {
+                collection_builder.build(&input_reports, &output_reports, &feature_reports)
+            })
+            .collect();
+
         if input_reports.len() > 1 {
             if input_reports
                 .iter()
-                .any(|input_report| input_report.report_id.is_none())
+                .any(|input_report| input_report.report_id().is_none())
             {
                 return Err(UsbHidReportError::ReportIdMissing);
             }
@@ -92,7 +118,7 @@ impl UsbHidReportDescriptorBuilder {
         if output_reports.len() > 1 {
             if output_reports
                 .iter()
-                .any(|output_report| output_report.report_id.is_none())
+                .any(|output_report| output_report.report_id().is_none())
             {
                 return Err(UsbHidReportError::ReportIdMissing);
             }
@@ -101,17 +127,13 @@ impl UsbHidReportDescriptorBuilder {
         if feature_reports.len() > 1 {
             if feature_reports
                 .iter()
-                .any(|feature_report| feature_report.report_id.is_none())
+                .any(|feature_report| feature_report.report_id().is_none())
             {
                 return Err(UsbHidReportError::ReportIdMissing);
             }
         }
 
-        Ok(UsbHidReportDescriptor {
-            input_reports,
-            output_reports,
-            feature_reports,
-        })
+        Ok(UsbHidReportDescriptor { root_collections })
     }
 
     fn parse_main_item(&mut self, main_item: item::Main) -> Result<(), UsbHidReportError> {
@@ -130,8 +152,32 @@ impl UsbHidReportDescriptorBuilder {
                 Some(feature_flags.0),
                 Some(&*self.feature_report_fields.entry(report_id).or_default()),
             ),
-            item::Main::Collection(_) => (None, None),
-            item::Main::EndCollection => (None, None),
+            item::Main::Collection(collection_type) => {
+                let Some(usage) = self.current_usages()?.first().copied() else {
+                    return Err(UsbHidReportError::UsageMissing);
+                };
+
+                let collection = UsbHidReportCollectionBuilder::new(usage, collection_type);
+
+                if let Some(last_collection) = self.open_collections.last_mut() {
+                    last_collection.add_child_collection(collection.clone());
+                }
+
+                self.open_collections.push(collection);
+
+                (None, None)
+            }
+            item::Main::EndCollection => {
+                if let Some(collection) = self.open_collections.pop() {
+                    if self.open_collections.is_empty() {
+                        self.root_collections.push(collection);
+                    }
+                } else {
+                    return Err(UsbHidReportError::UnexpectedEndCollection);
+                }
+
+                (None, None)
+            }
             item::Main::Reserved(_, _) => (None, None),
         };
 
@@ -144,21 +190,21 @@ impl UsbHidReportDescriptorBuilder {
                 .max()
                 .unwrap_or(8);
 
-            let mut fields = if field_flags.is_variable() {
-                let report_size = self.current_report_size()?;
-                let report_count = self.current_report_count()?;
-                let usages = self.current_usages()?;
-                let designator_indices = self.current_designator_indices()?;
-                let string_indices = self.current_string_indices()?;
+            let usages = self.current_usages()?;
+            let report_size = self.current_report_size()?;
+            let report_count = self.current_report_count()?;
+            let designator_indices = self.current_designator_indices()?;
+            let string_indices = self.current_string_indices()?;
 
-                if usages.is_empty() {
-                    return Err(UsbHidReportError::UsageMissing);
-                }
+            let mut fields = (0..report_count)
+                .map(|index| {
+                    let start_offset = current_field_offset + report_size * index;
+                    let end_offset = current_field_offset + report_size * (index + 1);
+                    let bits = start_offset..end_offset;
 
-                (0..report_count)
-                    .map(|index| {
-                        let start_offset = current_field_offset + report_size * index;
-                        let end_offset = current_field_offset + report_size * (index + 1);
+                    if usages.is_empty() {
+                        UsbHidReportField::Padding(Arc::new(UsbHidReportPaddingField { bits }))
+                    } else if field_flags.is_variable() {
                         let usage = usages
                             .get(index as usize)
                             .or_else(|| usages.last())
@@ -173,7 +219,7 @@ impl UsbHidReportDescriptorBuilder {
                             .or_else(|| string_indices.last())
                             .copied();
 
-                        UsbHidReportField::Variable(UsbHidReportVariableField {
+                        UsbHidReportField::Variable(Arc::new(UsbHidReportVariableField {
                             is_constant: field_flags.is_constant(),
                             report_id,
                             usage,
@@ -186,26 +232,9 @@ impl UsbHidReportDescriptorBuilder {
                             physical_maximum: current_global_state!(self, PhysicalMaximum),
                             unit_exponent: current_global_state!(self, UnitExponent),
                             unit: current_global_state!(self, Unit),
-                        })
-                    })
-                    .collect()
-            } else {
-                let report_size = self.current_report_size()?;
-                let report_count = self.current_report_count()?;
-                let usages = self.current_usages()?;
-                let designator_indices = self.current_designator_indices()?;
-                let string_indices = self.current_string_indices()?;
-
-                if usages.is_empty() {
-                    return Err(UsbHidReportError::UsageMissing);
-                }
-
-                (0..report_count)
-                    .map(|index| {
-                        let start_offset = current_field_offset + report_size * index;
-                        let end_offset = current_field_offset + report_size * (index + 1);
-
-                        UsbHidReportField::Array(UsbHidReportArrayField {
+                        }))
+                    } else {
+                        UsbHidReportField::Array(Arc::new(UsbHidReportArrayField {
                             is_constant: field_flags.is_constant(),
                             report_id,
                             usages: usages.clone(),
@@ -214,27 +243,37 @@ impl UsbHidReportDescriptorBuilder {
                             bits: start_offset..end_offset,
                             logical_minimum: current_global_state!(self, LogicalMinimum),
                             logical_maximum: current_global_state!(self, LogicalMaximum),
-                        })
-                    })
-                    .collect()
+                        }))
+                    }
+                })
+                .collect();
+
+            let Some(last_collection) = self.open_collections.last_mut() else {
+                return Err(UsbHidReportError::ReportOutsideCollection);
             };
 
             match main_item {
-                item::Main::Input(_) => self
-                    .input_report_fields
-                    .entry(report_id)
-                    .or_default()
-                    .append(&mut fields),
-                item::Main::Output(_) => self
-                    .output_report_fields
-                    .entry(report_id)
-                    .or_default()
-                    .append(&mut fields),
-                item::Main::Feature(_) => self
-                    .feature_report_fields
-                    .entry(report_id)
-                    .or_default()
-                    .append(&mut fields),
+                item::Main::Input(_) => {
+                    last_collection.add_input_report_id(report_id);
+                    self.input_report_fields
+                        .entry(report_id)
+                        .or_default()
+                        .append(&mut fields)
+                }
+                item::Main::Output(_) => {
+                    last_collection.add_output_report_id(report_id);
+                    self.output_report_fields
+                        .entry(report_id)
+                        .or_default()
+                        .append(&mut fields)
+                }
+                item::Main::Feature(_) => {
+                    last_collection.add_feature_report_id(report_id);
+                    self.feature_report_fields
+                        .entry(report_id)
+                        .or_default()
+                        .append(&mut fields)
+                }
                 _ => {}
             };
         }
@@ -422,5 +461,98 @@ impl UsbHidReportDescriptorBuilder {
         }
 
         Ok(current_string_indices)
+    }
+}
+
+impl UsbHidReportCollectionBuilder {
+    pub fn new(usage: ExtendedUsage, collection_type: CollectionType) -> Self {
+        let inner = UsbHidReportCollectionBuilderInner {
+            usage,
+            collection_type,
+            input_report_ids: BTreeSet::new(),
+            output_report_ids: BTreeSet::new(),
+            feature_report_ids: BTreeSet::new(),
+            child_collections: vec![],
+        };
+
+        Self(Arc::new(Mutex::new(inner)))
+    }
+
+    pub fn add_input_report_id(&self, report_id: Option<u8>) {
+        self.0.lock().unwrap().input_report_ids.insert(report_id);
+    }
+
+    pub fn add_output_report_id(&self, report_id: Option<u8>) {
+        self.0.lock().unwrap().output_report_ids.insert(report_id);
+    }
+
+    pub fn add_feature_report_id(&self, report_id: Option<u8>) {
+        self.0.lock().unwrap().feature_report_ids.insert(report_id);
+    }
+
+    pub fn add_child_collection(&self, collection: UsbHidReportCollectionBuilder) {
+        self.0.lock().unwrap().child_collections.push(collection);
+    }
+
+    pub fn build(
+        &self,
+        all_input_reports: &Vec<UsbHidReport>,
+        all_output_reports: &Vec<UsbHidReport>,
+        all_feature_reports: &Vec<UsbHidReport>,
+    ) -> UsbHidReportCollection {
+        let inner = self.0.lock().unwrap();
+
+        let child_collections = inner
+            .child_collections
+            .iter()
+            .map(|collection_builder| {
+                collection_builder.build(all_input_reports, all_output_reports, all_feature_reports)
+            })
+            .collect();
+
+        let input_reports = inner
+            .input_report_ids
+            .iter()
+            .map(|&report_id| {
+                all_input_reports
+                    .iter()
+                    .find(|&report| report.report_id() == report_id)
+                    .expect("input report not found")
+                    .clone()
+            })
+            .collect();
+
+        let output_reports = inner
+            .output_report_ids
+            .iter()
+            .map(|&report_id| {
+                all_output_reports
+                    .iter()
+                    .find(|&report| report.report_id() == report_id)
+                    .expect("output report not found")
+                    .clone()
+            })
+            .collect();
+
+        let feature_reports = inner
+            .feature_report_ids
+            .iter()
+            .map(|&report_id| {
+                all_feature_reports
+                    .iter()
+                    .find(|&report| report.report_id() == report_id)
+                    .expect("feature report not found")
+                    .clone()
+            })
+            .collect();
+
+        UsbHidReportCollection::new(
+            inner.usage,
+            inner.collection_type,
+            input_reports,
+            output_reports,
+            feature_reports,
+            child_collections,
+        )
     }
 }

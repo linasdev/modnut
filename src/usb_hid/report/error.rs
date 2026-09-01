@@ -1,6 +1,8 @@
 #[derive(Debug)]
 pub enum UsbHidReportError {
     PopBeforePush,
+    UnexpectedEndCollection,
+    ReportOutsideCollection,
     ReportIdMissing,
     ReportSizeMissing,
     ReportCountMissing,

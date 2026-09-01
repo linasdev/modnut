@@ -1,30 +1,32 @@
 use crate::device::UpsDevice;
 use crate::error::ModNutError;
 use crate::usb_hid::report::builder::UsbHidReportDescriptorBuilder;
-use crate::usb_hid::report::field::UsbHidReportField;
+use hid_types::id::KnownUsagePage;
+use hid_types::id::usage::power;
+use hid_types::item::usage::ExtendedUsage;
 use hidapi::{HidDevice, MAX_REPORT_DESCRIPTOR_SIZE};
 use log::{info, warn};
 
-pub enum UpsDeviceIdentifierUsbHid {
-    Serial(String),
-    PathAndInterfaceNumber(String, u32),
-}
-
 pub struct UpsDeviceUsbHid {
+    name: String,
+    manufacturer_name: Option<String>,
+    product_name: Option<String>,
+    serial_number: Option<String>,
     hid_device: HidDevice,
 }
 
 impl UpsDeviceUsbHid {
-    pub fn new(hid_device: HidDevice) -> Result<Self, ModNutError> {
+    pub fn new(name: String, hid_device: HidDevice) -> Result<Self, ModNutError> {
         let device_info = hid_device.get_device_info()?;
+        let manufacturer_name = device_info.manufacturer_string().map(String::from);
+        let product_name = device_info.product_string().map(String::from);
+        let serial_number = device_info.serial_number().map(String::from);
 
         info!(
-            "Found UPS on {:?}, vendor_id = {}, product_id = {}, manufacturer_name: {:?}, product_name: {:?}",
+            "Found device on {:?}, vendor_id = {}, product_id = {}, manufacturer_name: {manufacturer_name:?}, product_name: {product_name:?}, serial_number: {serial_number:?}",
             device_info.path(),
             device_info.vendor_id(),
             device_info.product_id(),
-            device_info.manufacturer_string(),
-            device_info.product_string(),
         );
 
         let mut report_descriptor_buffer = [0u8; MAX_REPORT_DESCRIPTOR_SIZE];
@@ -37,52 +39,41 @@ impl UpsDeviceUsbHid {
         let report_descriptor =
             UsbHidReportDescriptorBuilder::new().build(report_descriptor_items)?;
 
-        for feature_report in report_descriptor.feature_reports() {
-            // if let Some(report_id) = feature_report.report_id()
-            //     && report_id != 1
-            // {
-            //     continue;
-            // }
+        let ups_usage_exists = report_descriptor.root_collections().any(|root_collection| {
+            root_collection.usage()
+                == ExtendedUsage::new(KnownUsagePage::Power.into(), power::KnownUsage::Ups.into())
+        });
 
-            let mut feature_report_buffer = vec![0u8; feature_report.size_in_bytes()];
-            feature_report_buffer[0] = feature_report.report_id().unwrap_or(0);
-            let feature_report_size = hid_device.get_feature_report(&mut feature_report_buffer)?;
-
-            for field in feature_report.fields() {
-                match field {
-                    UsbHidReportField::Variable(variable_field) => {
-                        let field_value = variable_field
-                            .extract_physical_value(&feature_report_buffer[..feature_report_size])
-                            .ok()
-                            .flatten();
-                        println!(
-                            "VAR {:?} {:?} {:?}",
-                            variable_field.usage, variable_field.bits, field_value
-                        );
-                    }
-                    UsbHidReportField::Array(array_field) => {
-                        let field_value = array_field
-                            .extract_logical_value(&feature_report_buffer[..feature_report_size])
-                            .ok()
-                            .flatten();
-                        println!(
-                            "ARR {:?} {:?} {:?}",
-                            array_field.usages, array_field.bits, field_value
-                        );
-                    }
-                    UsbHidReportField::Padding(padding_field) => {
-                        println!("PAD {:?}", padding_field.bits);
-                    }
-                }
-            }
-
-            warn!("");
-            warn!("");
-            warn!("");
+        if !ups_usage_exists {
+            warn!(
+                "No root collection with usage Power.Ups found in device's HID report descriptor"
+            );
         }
 
-        Ok(Self { hid_device })
+        Ok(Self {
+            name,
+            manufacturer_name,
+            product_name,
+            serial_number,
+            hid_device,
+        })
     }
 }
 
-impl UpsDevice for UpsDeviceUsbHid {}
+impl UpsDevice for UpsDeviceUsbHid {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn manufacturer_name(&self) -> Option<String> {
+        self.manufacturer_name.clone()
+    }
+
+    fn product_name(&self) -> Option<String> {
+        self.product_name.clone()
+    }
+
+    fn serial_number(&self) -> Option<String> {
+        self.serial_number.clone()
+    }
+}
